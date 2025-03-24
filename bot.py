@@ -54,12 +54,9 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # Check if the 'users' table exists
         cursor.execute("SHOW TABLES LIKE 'users'")
         table_exists = cursor.fetchone()
-
         if not table_exists:
-            # Create the 'users' table
             cursor.execute("""
                 CREATE TABLE users (
                     chat_id BIGINT PRIMARY KEY,
@@ -126,17 +123,24 @@ def update_default_wallet(chat_id, wallet_id):
 
 # Token refresh (basic implementation)
 def refresh_token_if_needed(user, chat_id, reply_func):
-    if not user or not user.get("token_expiry"):
+    if not user:
+        logger.warning(f"No user found for chat_id {chat_id}")
+        reply_func("⚠️ Please /login to continue.")
+        return None
+    if not user.get("token_expiry"):
+        logger.warning(f"No token expiry found for user {chat_id}")
         reply_func("⚠️ Please /login to continue.")
         return None
     try:
         expiry = datetime.strptime(user["token_expiry"], "%Y-%m-%d %H:%M:%S")
         if datetime.now() >= expiry:
+            logger.info(f"Token expired for user {chat_id}, expiry: {user['token_expiry']}")
             reply_func("⚠️ Your session has expired. Please /login again to continue.")
             return None
+        logger.info(f"Token is valid for user {chat_id}, expiry: {user['token_expiry']}")
         return user
     except ValueError as e:
-        logger.error(f"Error parsing token expiry: {e}")
+        logger.error(f"Error parsing token expiry for user {chat_id}: {e}")
         reply_func("⚠️ Session error. Please /login again.")
         return None
 
@@ -167,13 +171,23 @@ def get_command_menu():
 # Start command
 def start(update, context):
     try:
-        user = update.message.from_user.first_name
-        update.message.reply_text(
-            f"🌟 *Welcome to the Copperx Payout Bot, {user}!* 🌟\n"
-            "Easily manage your USDC transactions directly in Telegram. To begin, please /login with your Copperx credentials or use /help to explore all available commands.",
-            parse_mode="Markdown",
-            reply_markup=get_command_menu()
-        )
+        chat_id = update.message.chat_id
+        user = get_user(chat_id)
+        user_name = update.message.from_user.first_name
+        if user:
+            update.message.reply_text(
+                f"👋 *Welcome back, {user_name}!* 🌟\n"
+                f"You’re logged in as {user['email']}. Use the menu below to manage your USDC transactions:",
+                parse_mode="Markdown",
+                reply_markup=get_command_menu()
+            )
+        else:
+            update.message.reply_text(
+                f"🌟 *Welcome to the Copperx Payout Bot, {user_name}!* 🌟\n"
+                "Easily manage your USDC transactions directly in Telegram. To begin, please /login with your Copperx credentials or use /help to explore all available commands.",
+                parse_mode="Markdown",
+                reply_markup=get_command_menu()
+            )
     except Exception as e:
         logger.error(f"Error in start command: {e}")
         update.message.reply_text(
@@ -191,6 +205,7 @@ def help_command(update, context):
             "🔐 *Account Management*\n"
             "/start - Start the bot\n"
             "/login - Log in to Copperx\n"
+            "/logout - Log out of Copperx\n"
             "/profile - View your account details\n"
             "/kyc - Check your KYC/KYB status\n\n"
             "👛 *Wallet Management*\n"
@@ -225,6 +240,37 @@ def menu_callback(update, context):
         logger.error(f"Error in menu_callback: {e}")
         query.message.reply_text(
             "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            parse_mode="Markdown"
+        )
+
+# Logout command
+def logout(update, context):
+    try:
+        chat_id = update.message.chat_id
+        reply_func = update.message.reply_text
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM users WHERE chat_id = %s", (chat_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        reply_func(
+            "👋 *Logged out successfully!*\n"
+            "You’ve been logged out of Copperx. Use /login to sign in again.\n\n"
+            "Use the menu below to continue:",
+            parse_mode="Markdown",
+            reply_markup=get_command_menu()
+        )
+    except mysql.connector.Error as e:
+        logger.error(f"Error in logout for user {chat_id}: {e}")
+        reply_func(
+            "❌ *Error logging out.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in logout for user {chat_id}: {e}")
+        reply_func(
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -384,7 +430,15 @@ def profile(update, context):
         headers = {"Authorization": f"Bearer {user['token']}"}
         response = requests.get(f"{BASE_URL}/auth/me", headers=headers)
         if response.status_code == 200:
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError as e:
+                logger.error(f"Error parsing JSON response in profile: {e}, response: {response.text}")
+                reply_func(
+                    "❌ *Error:* Invalid response from Copperx. Please try again or contact support: https://t.me/copperxcommunity/2183",
+                    parse_mode="Markdown"
+                )
+                return
             reply_func(
                 f"👤 *Your Copperx Profile:*\n\n"
                 f"📧 *Email:* {data['email']}\n"
@@ -396,22 +450,27 @@ def profile(update, context):
                 reply_markup=get_command_menu()
             )
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error fetching profile for user {chat_id}: {response.status_code}, {error_msg}")
             reply_func(
-                f"❌ *Error fetching profile:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Error fetching profile:* {error_msg}\n"
                 "Please try again or contact support: https://t.me/copperxcommunity/2183",
                 parse_mode="Markdown"
             )
     except requests.RequestException as e:
-        logger.error(f"Network error in profile: {e}")
+        logger.error(f"Network error in profile for user {chat_id}: {e}")
         reply_func(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Error in profile: {e}")
+        logger.error(f"Unexpected error in profile for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -426,8 +485,16 @@ def kyc(update, context):
         headers = {"Authorization": f"Bearer {user['token']}"}
         response = requests.get(f"{BASE_URL}/kycs", headers=headers)
         if response.status_code == 200:
-            kycs = response.json()
-            if kycs and kycs[0]["status"] == "approved":
+            try:
+                kycs = response.json()
+            except ValueError as e:
+                logger.error(f"Error parsing JSON response in kyc for user {chat_id}: {e}, response: {response.text}")
+                reply_func(
+                    "❌ *Error:* Invalid response from Copperx. Please try again or contact support: https://t.me/copperxcommunity/2183",
+                    parse_mode="Markdown"
+                )
+                return
+            if kycs and isinstance(kycs, list) and kycs[0].get("status") == "approved":
                 reply_func(
                     "✅ *KYC/KYB Approved!*\n"
                     "You’re all set to perform transactions.\n\n"
@@ -444,22 +511,27 @@ def kyc(update, context):
                     reply_markup=get_command_menu()
                 )
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error checking KYC for user {chat_id}: {response.status_code}, {error_msg}")
             reply_func(
-                f"❌ *Error checking KYC:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Error checking KYC:* {error_msg}\n"
                 "Please try again or contact support: https://t.me/copperxcommunity/2183",
                 parse_mode="Markdown"
             )
     except requests.RequestException as e:
-        logger.error(f"Network error in kyc: {e}")
+        logger.error(f"Network error in kyc for user {chat_id}: {e}")
         reply_func(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Error in kyc: {e}")
+        logger.error(f"Unexpected error in kyc for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -475,8 +547,16 @@ def balance(update, context):
         headers = {"Authorization": f"Bearer {user['token']}"}
         response = requests.get(f"{BASE_URL}/wallets/balances", headers=headers)
         if response.status_code == 200:
-            balances = response.json()
-            if not balances:
+            try:
+                balances = response.json()
+            except ValueError as e:
+                logger.error(f"Error parsing JSON response in balance for user {chat_id}: {e}, response: {response.text}")
+                reply_func(
+                    "❌ *Error:* Invalid response from Copperx. Please try again or contact support: https://t.me/copperxcommunity/2183",
+                    parse_mode="Markdown"
+                )
+                return
+            if not balances or not isinstance(balances, list):
                 reply_func(
                     "⚠️ *No wallet balances found.*\n"
                     "Please deposit USDC to your wallet. Use /deposit for instructions.\n\n"
@@ -487,26 +567,33 @@ def balance(update, context):
                 return
             message = "💰 *Your Wallet Balances:*\n\n"
             for b in balances:
-                message += f"- {b['amount']} USDC on {b['network']}\n"
+                amount = b.get('amount', '0')
+                network = b.get('network', 'Unknown')
+                message += f"- {amount} USDC on {network}\n"
             message += "\nUse the menu below to continue:"
             reply_func(message, parse_mode="Markdown", reply_markup=get_command_menu())
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error fetching balances for user {chat_id}: {response.status_code}, {error_msg}")
             reply_func(
-                f"❌ *Error fetching balances:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Error fetching balances:* {error_msg}\n"
                 "Please try again or contact support: https://t.me/copperxcommunity/2183",
                 parse_mode="Markdown"
             )
     except requests.RequestException as e:
-        logger.error(f"Network error in balance: {e}")
+        logger.error(f"Network error in balance for user {chat_id}: {e}")
         reply_func(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Error in balance: {e}")
+        logger.error(f"Unexpected error in balance for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -521,8 +608,16 @@ def setdefault(update, context):
         headers = {"Authorization": f"Bearer {user['token']}"}
         response = requests.get(f"{BASE_URL}/wallets", headers=headers)
         if response.status_code == 200:
-            wallets = response.json()
-            if not wallets:
+            try:
+                wallets = response.json()
+            except ValueError as e:
+                logger.error(f"Error parsing JSON response in setdefault for user {chat_id}: {e}, response: {response.text}")
+                reply_func(
+                    "❌ *Error:* Invalid response from Copperx. Please try again or contact support: https://t.me/copperxcommunity/2183",
+                    parse_mode="Markdown"
+                )
+                return
+            if not wallets or not isinstance(wallets, list):
                 reply_func(
                     "⚠️ *No wallets found.*\n"
                     "Please add a wallet on the Copperx platform: https://copperx.io\n\n"
@@ -532,9 +627,18 @@ def setdefault(update, context):
                 )
                 return
             keyboard = [
-                [InlineKeyboardButton(w["network"], callback_data=f"default_{w['id']}")]
-                for w in wallets
+                [InlineKeyboardButton(w.get("network", "Unknown"), callback_data=f"default_{w['id']}")]
+                for w in wallets if w.get("id")
             ]
+            if not keyboard:
+                reply_func(
+                    "⚠️ *No valid wallets found.*\n"
+                    "Please add a wallet on the Copperx platform: https://copperx.io\n\n"
+                    "Use the menu below to continue:",
+                    parse_mode="Markdown",
+                    reply_markup=get_command_menu()
+                )
+                return
             reply_func(
                 "🔧 *Select your default wallet:*\n"
                 "This wallet will be used for transactions.",
@@ -542,22 +646,27 @@ def setdefault(update, context):
                 parse_mode="Markdown"
             )
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error fetching wallets for user {chat_id}: {response.status_code}, {error_msg}")
             reply_func(
-                f"❌ *Error fetching wallets:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Error fetching wallets:* {error_msg}\n"
                 "Please try again or contact support: https://t.me/copperxcommunity/2183",
                 parse_mode="Markdown"
             )
     except requests.RequestException as e:
-        logger.error(f"Network error in setdefault: {e}")
+        logger.error(f"Network error in setdefault for user {chat_id}: {e}")
         reply_func(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Error in setdefault: {e}")
+        logger.error(f"Unexpected error in setdefault for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -565,8 +674,12 @@ def setdefault_callback(update, context):
     try:
         query = update.callback_query
         wallet_id = query.data.split("_")[1]
-        user = get_user(query.message.chat_id)
-        update_default_wallet(query.message.chat_id, wallet_id)
+        chat_id = query.message.chat_id
+        user = get_user(chat_id)
+        user = refresh_token_if_needed(user, chat_id, query.message.reply_text)
+        if not user:
+            return
+        update_default_wallet(chat_id, wallet_id)
         response = requests.put(
             f"{BASE_URL}/wallets/default",
             json={"walletId": wallet_id},
@@ -580,22 +693,27 @@ def setdefault_callback(update, context):
                 reply_markup=get_command_menu()
             )
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error setting default wallet for user {chat_id}: {response.status_code}, {error_msg}")
             query.edit_message_text(
-                f"❌ *Error setting default wallet:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Error setting default wallet:* {error_msg}\n"
                 "Please try again or contact support: https://t.me/copperxcommunity/2183",
                 parse_mode="Markdown"
             )
     except requests.RequestException as e:
-        logger.error(f"Network error in setdefault_callback: {e}")
+        logger.error(f"Network error in setdefault_callback for user {chat_id}: {e}")
         query.edit_message_text(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Error in setdefault_callback: {e}")
+        logger.error(f"Unexpected error in setdefault_callback for user {chat_id}: {e}")
         query.edit_message_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -620,9 +738,9 @@ def deposit(update, context):
             reply_markup=get_command_menu()
         )
     except Exception as e:
-        logger.error(f"Error in deposit: {e}")
+        logger.error(f"Error in deposit for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -637,8 +755,16 @@ def history(update, context):
         headers = {"Authorization": f"Bearer {user['token']}"}
         response = requests.get(f"{BASE_URL}/transfers?page=1&limit=10", headers=headers)
         if response.status_code == 200:
-            transfers = response.json()
-            if not transfers:
+            try:
+                transfers = response.json()
+            except ValueError as e:
+                logger.error(f"Error parsing JSON response in history for user {chat_id}: {e}, response: {response.text}")
+                reply_func(
+                    "❌ *Error:* Invalid response from Copperx. Please try again or contact support: https://t.me/copperxcommunity/2183",
+                    parse_mode="Markdown"
+                )
+                return
+            if not transfers or not isinstance(transfers, list):
                 reply_func(
                     "📜 *Transaction History:*\n\n"
                     "No recent transactions found.\n"
@@ -650,26 +776,34 @@ def history(update, context):
                 return
             message = "📜 *Last 10 Transactions:*\n\n"
             for t in transfers:
-                message += f"- {t['amount']} USDC ({t['type']}) on {t['createdAt'][:10]}\n"
+                amount = t.get('amount', '0')
+                transfer_type = t.get('type', 'Unknown')
+                created_at = t.get('createdAt', 'Unknown')[:10] if t.get('createdAt') else 'Unknown'
+                message += f"- {amount} USDC ({transfer_type}) on {created_at}\n"
             message += "\nUse the menu below to continue:"
             reply_func(message, parse_mode="Markdown", reply_markup=get_command_menu())
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error fetching history for user {chat_id}: {response.status_code}, {error_msg}")
             reply_func(
-                f"❌ *Error fetching history:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Error fetching history:* {error_msg}\n"
                 "Please try again or contact support: https://t.me/copperxcommunity/2183",
                 parse_mode="Markdown"
             )
     except requests.RequestException as e:
-        logger.error(f"Network error in history: {e}")
+        logger.error(f"Network error in history for user {chat_id}: {e}")
         reply_func(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Error in history: {e}")
+        logger.error(f"Unexpected error in history for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
 
@@ -684,7 +818,8 @@ def send(update, context):
             return ConversationHandler.END
         keyboard = [
             [InlineKeyboardButton("Email", callback_data="send_email")],
-            [InlineKeyboardButton("Wallet", callback_data="send_wallet")]
+            [InlineKeyboardButton("Wallet", callback_data="send_wallet")],
+            [InlineKeyboardButton("Cancel", callback_data="send_cancel")]
         ]
         reply_func(
             "📤 *Send USDC:*\n"
@@ -694,9 +829,9 @@ def send(update, context):
         )
         return SEND_TYPE
     except Exception as e:
-        logger.error(f"Error in send: {e}")
+        logger.error(f"Error in send for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -715,7 +850,7 @@ def send_type(update, context):
     except Exception as e:
         logger.error(f"Error in send_type: {e}")
         query.message.reply_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -746,7 +881,7 @@ def send_recipient(update, context):
     except Exception as e:
         logger.error(f"Error in send_recipient: {e}")
         update.message.reply_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -786,7 +921,7 @@ def send_amount(update, context):
     except Exception as e:
         logger.error(f"Error in send_amount: {e}")
         update.message.reply_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -795,7 +930,11 @@ def send_confirm(update, context):
     try:
         query = update.callback_query
         query.answer()
-        user = get_user(query.message.chat_id)
+        chat_id = query.message.chat_id
+        user = get_user(chat_id)
+        user = refresh_token_if_needed(user, chat_id, query.message.reply_text)
+        if not user:
+            return ConversationHandler.END
         send_type = context.user_data.get("send_type")
         recipient = context.user_data.get("recipient")
         amount = context.user_data.get("amount")
@@ -818,14 +957,19 @@ def send_confirm(update, context):
                 reply_markup=get_command_menu()
             )
         else:
+            try:
+                error_msg = response.json().get('message', 'Unknown error')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error in send_confirm for user {chat_id}: {response.status_code}, {error_msg}")
             query.edit_message_text(
-                f"❌ *Transfer failed:* {response.json().get('message', 'Unknown error')}\n"
+                f"❌ *Transfer failed:* {error_msg}\n"
                 "Please check the recipient details and your balance, then try again.",
                 parse_mode="Markdown"
             )
         return ConversationHandler.END
     except requests.RequestException as e:
-        logger.error(f"Network error in send_confirm: {e}")
+        logger.error(f"Network error in send_confirm for user {chat_id}: {e}")
         query.edit_message_text(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
@@ -833,9 +977,9 @@ def send_confirm(update, context):
         )
         return ConversationHandler.END
     except Exception as e:
-        logger.error(f"Error in send_confirm: {e}")
+        logger.error(f"Unexpected error in send_confirm for user {chat_id}: {e}")
         query.edit_message_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -848,16 +992,20 @@ def withdraw(update, context):
         user = refresh_token_if_needed(user, chat_id, reply_func)
         if not user:
             return ConversationHandler.END
+        keyboard = [
+            [InlineKeyboardButton("Cancel", callback_data="withdraw_cancel")]
+        ]
         reply_func(
             "🏦 *Withdraw to Bank:*\n"
             "Please enter the amount in USDC to withdraw:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return WITHDRAW_AMOUNT
     except Exception as e:
-        logger.error(f"Error in withdraw: {e}")
+        logger.error(f"Error in withdraw for user {chat_id}: {e}")
         reply_func(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -890,7 +1038,7 @@ def withdraw_amount(update, context):
     except Exception as e:
         logger.error(f"Error in withdraw_amount: {e}")
         update.message.reply_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -899,7 +1047,11 @@ def withdraw_confirm(update, context):
     try:
         query = update.callback_query
         query.answer()
-        user = get_user(query.message.chat_id)
+        chat_id = query.message.chat_id
+        user = get_user(chat_id)
+        user = refresh_token_if_needed(user, chat_id, query.message.reply_text)
+        if not user:
+            return ConversationHandler.END
         amount = context.user_data.get("withdraw_amount")
         if not amount:
             query.message.reply_text(
@@ -923,14 +1075,19 @@ def withdraw_confirm(update, context):
                 reply_markup=get_command_menu()
             )
         else:
+            try:
+                error_msg = response.json().get('message', 'Check balance or KYC')
+            except ValueError:
+                error_msg = "Invalid response from Copperx"
+            logger.error(f"Error in withdraw_confirm for user {chat_id}: {response.status_code}, {error_msg}")
             query.edit_message_text(
-                f"❌ *Withdrawal failed:* {response.json().get('message', 'Check balance or KYC')}\n"
+                f"❌ *Withdrawal failed:* {error_msg}\n"
                 "Please ensure your KYC is approved and you have sufficient balance.",
                 parse_mode="Markdown"
             )
         return ConversationHandler.END
     except requests.RequestException as e:
-        logger.error(f"Network error in withdraw_confirm: {e}")
+        logger.error(f"Network error in withdraw_confirm for user {chat_id}: {e}")
         query.edit_message_text(
             f"❌ *Network error:* {str(e)}\n"
             "Please check your connection and try again.",
@@ -938,9 +1095,9 @@ def withdraw_confirm(update, context):
         )
         return ConversationHandler.END
     except Exception as e:
-        logger.error(f"Error in withdraw_confirm: {e}")
+        logger.error(f"Unexpected error in withdraw_confirm for user {chat_id}: {e}")
         query.edit_message_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -957,7 +1114,7 @@ def cancel(update, context):
     except Exception as e:
         logger.error(f"Error in cancel: {e}")
         update.message.reply_text(
-            "❌ *An error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
+            "❌ *An unexpected error occurred.* Please try again or contact support: https://t.me/copperxcommunity/2183",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -984,7 +1141,7 @@ def start_pusher(chat_id, token, org_id, context):
         channel.bind("deposit", lambda data: context.bot.send_message(
             chat_id,
             f"💰 *New Deposit Received!*\n\n"
-            f"Amount: {data['amount']} USDC\n"
+            f"Amount: {data.get('amount', '0')} USDC\n"
             f"Network: {data.get('network', 'Unknown')}\n\n"
             "Use /balance to check your updated balance.",
             parse_mode="Markdown"
@@ -992,7 +1149,7 @@ def start_pusher(chat_id, token, org_id, context):
         threading.Thread(target=lambda: pusher_client.connect(), daemon=True).start()
         logger.info(f"Pusher connected for chat_id {chat_id} on organization {org_id}")
     except Exception as e:
-        logger.error(f"Error in start_pusher: {e}")
+        logger.error(f"Error in start_pusher for chat_id {chat_id}: {e}")
         context.bot.send_message(
             chat_id,
             f"⚠️ *Error setting up deposit notifications:* {str(e)}\n"
@@ -1017,17 +1174,14 @@ def error_handler(update, context):
 # Main function
 def main():
     try:
-        # Initialize the database (create the 'users' table if it doesn't exist)
         init_db()
-
         updater = Updater(TELEGRAM_TOKEN, use_context=True)
         dp = updater.dispatcher
-
-        # Set Telegram command menu
         bot = updater.bot
         commands = [
             ("start", "Start the bot"),
             ("login", "Log in to Copperx"),
+            ("logout", "Log out of Copperx"),
             ("profile", "View account info"),
             ("kyc", "Check KYC status"),
             ("balance", "Check wallet balances"),
@@ -1039,10 +1193,10 @@ def main():
             ("help", "Show this message")
         ]
         bot.set_my_commands([(cmd, desc) for cmd, desc in commands])
-
         dp.add_handler(CommandHandler("start", start))
         dp.add_handler(CommandHandler("help", help_command))
         dp.add_handler(CallbackQueryHandler(menu_callback, pattern="^cmd_"))
+        dp.add_handler(CommandHandler("logout", logout))
         dp.add_handler(CommandHandler("profile", profile))
         dp.add_handler(CommandHandler("kyc", kyc))
         dp.add_handler(CommandHandler("balance", balance))
@@ -1050,7 +1204,6 @@ def main():
         dp.add_handler(CallbackQueryHandler(setdefault_callback, pattern="^default_"))
         dp.add_handler(CommandHandler("deposit", deposit))
         dp.add_handler(CommandHandler("history", history))
-
         send_conv = ConversationHandler(
             entry_points=[CommandHandler("send", send)],
             states={
@@ -1063,7 +1216,6 @@ def main():
             fallbacks=[CommandHandler("cancel", cancel)]
         )
         dp.add_handler(send_conv)
-
         withdraw_conv = ConversationHandler(
             entry_points=[CommandHandler("withdraw", withdraw)],
             states={
@@ -1074,7 +1226,6 @@ def main():
             fallbacks=[CommandHandler("cancel", cancel)]
         )
         dp.add_handler(withdraw_conv)
-
         login_conv = ConversationHandler(
             entry_points=[CommandHandler("login", login)],
             states={
@@ -1084,9 +1235,7 @@ def main():
             fallbacks=[CommandHandler("cancel", cancel)]
         )
         dp.add_handler(login_conv)
-
         dp.add_error_handler(error_handler)
-
         updater.start_polling()
         print("Bot is running...")
         updater.idle()
