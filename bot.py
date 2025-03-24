@@ -24,6 +24,8 @@ if not COPPERX_API_TOKEN:
     raise ValueError("COPPERX_API_TOKEN not found in .env file")
 PUSHER_KEY = os.getenv("PUSHER_KEY")
 PUSHER_CLUSTER = os.getenv("PUSHER_CLUSTER")
+PUSHER_APP_ID = os.getenv("PUSHER_APP_ID")
+PUSHER_SECRET = os.getenv("PUSHER_SECRET")
 BASE_URL = "https://income-api.copperx.io/api"
 
 # MySQL connection
@@ -44,6 +46,40 @@ def get_db_connection():
     except mysql.connector.Error as e:
         logger.error(f"Database connection error: {e}")
         raise
+
+def init_db():
+    """
+    Initialize the database by creating the 'users' table if it doesn't exist.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Check if the 'users' table exists
+        cursor.execute("SHOW TABLES LIKE 'users'")
+        table_exists = cursor.fetchone()
+
+        if not table_exists:
+            # Create the 'users' table
+            cursor.execute("""
+                CREATE TABLE users (
+                    chat_id BIGINT PRIMARY KEY,
+                    email VARCHAR(255),
+                    token TEXT,
+                    organization_id VARCHAR(255),
+                    token_expiry VARCHAR(50),
+                    default_wallet VARCHAR(255)
+                )
+            """)
+            conn.commit()
+            logger.info("Created 'users' table in the database.")
+        else:
+            logger.info("'users' table already exists in the database.")
+    except mysql.connector.Error as e:
+        logger.error(f"Error initializing database: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 def save_user(chat_id, email, token, organization_id=None, token_expiry=None):
     conn = get_db_connection()
@@ -184,8 +220,6 @@ def menu_callback(update, context):
         command = query.data.split("_")[1]
         query.answer()
         chat_id = query.message.chat_id
-
-        # Send the command as a message to trigger the appropriate handler
         context.bot.send_message(chat_id=chat_id, text=f"/{command}")
     except Exception as e:
         logger.error(f"Error in menu_callback: {e}")
@@ -226,7 +260,6 @@ def get_email(update, context):
         response = requests.post(f"{BASE_URL}/auth/email-otp/request", json={"email": email}, headers=headers)
         logger.info(f"API response status: {response.status_code}, response: {response.text}")
         if response.status_code == 200:
-            # Capture the sid from the response
             response_data = response.json()
             sid = response_data.get("sid")
             if not sid:
@@ -932,10 +965,21 @@ def cancel(update, context):
 # Pusher for Deposit Notifications
 def start_pusher(chat_id, token, org_id, context):
     try:
-        if not PUSHER_KEY or not PUSHER_CLUSTER:
-            logger.warning("Pusher credentials not found. Deposit notifications will not be enabled.")
+        if not all([PUSHER_KEY, PUSHER_CLUSTER, PUSHER_APP_ID, PUSHER_SECRET]):
+            logger.warning("Pusher credentials incomplete. Deposit notifications will not be enabled.")
+            context.bot.send_message(
+                chat_id,
+                "⚠️ *Deposit notifications are disabled.* Pusher credentials are missing.\n"
+                "You can still use the bot, but you won’t receive real-time deposit updates.",
+                parse_mode="Markdown"
+            )
             return
-        pusher_client = Pusher(app_id='your-app-id', key=PUSHER_KEY, secret='your-secret', cluster=PUSHER_CLUSTER)
+        pusher_client = Pusher(
+            app_id=PUSHER_APP_ID,
+            key=PUSHER_KEY,
+            secret=PUSHER_SECRET,
+            cluster=PUSHER_CLUSTER
+        )
         channel = pusher_client.subscribe(f"private-org-{org_id}")
         channel.bind("deposit", lambda data: context.bot.send_message(
             chat_id,
@@ -946,6 +990,7 @@ def start_pusher(chat_id, token, org_id, context):
             parse_mode="Markdown"
         ))
         threading.Thread(target=lambda: pusher_client.connect(), daemon=True).start()
+        logger.info(f"Pusher connected for chat_id {chat_id} on organization {org_id}")
     except Exception as e:
         logger.error(f"Error in start_pusher: {e}")
         context.bot.send_message(
@@ -972,6 +1017,9 @@ def error_handler(update, context):
 # Main function
 def main():
     try:
+        # Initialize the database (create the 'users' table if it doesn't exist)
+        init_db()
+
         updater = Updater(TELEGRAM_TOKEN, use_context=True)
         dp = updater.dispatcher
 
